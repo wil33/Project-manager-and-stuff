@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""
+RCPSP Solver using Google OR-Tools CP-SAT
+===========================================
+
+Solves the Resource-Constrained Project Scheduling Problem (RCPSP) for
+one or more Courses of Action (COAs), given a heterogeneous input graph
+of tasks, personnel, and equipment nodes with directed precedence and
+resource-requirement edges.
+
+Input: JSON file per COA (see example_input.json for schema)
+Output: CSV file per COA formatted for Microsoft Project import
+        (Task Name, Duration, Start, Finish, Predecessors, Resource Names)
+
+Requires: ortools (pip install ortools --break-system-packages)
+
+Usage:
+    python3 rcpsp_solver.py --input coa1.json --output coa1_schedule.csv
+    python3 rcpsp_solver.py --input coa1.json --output coa1_schedule.csv --project-start 2026-09-08
+"""
+
+import argparse
+import json
+import sys
+from datetime import datetime, timedelta
+
+try:
+    from ortools.sat.python import cp_model
+except ImportError:
+    print("ERROR: ortools is not installed.")
+    print("Install it with: pip install ortools --break-system-packages")
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Input schema
+# ---------------------------------------------------------------------------
+#
+# {
+#   "coa_name": "COA 1",
+#   "resources": {
+#     "personnel": { "engineers": 4, "surveyors": 2 },
+#     "equipment": { "excavator": 2, "crane": 1 }
+#   },
+#   "tasks": [
+#     {
+#       "id": "T1",
+#       "name": "Site survey",
+#       "duration": 3,
+#       "predecessors": [],
+#       "requires": { "surveyors": 2 }
+#     },
+#     {
+#       "id": "T2",
+#       "name": "Excavation",
+#       "duration": 5,
+#       "predecessors": ["T1"],
+#       "requires": { "engineers": 2, "excavator": 1 }
+#     }
+#   ]
+# }
+#
+# Duration is in whole days (integer). Change TIME_UNIT below if you need
+# hours instead.
+#
+# Resource capacity (the "n" per resource type) lives under "resources" and
+# is shared across personnel + equipment — the model treats them identically
+# as cumulative resource pools; the personnel/equipment split is just for
+# your own bookkeeping and shows up in the output.
+
+
+class RCPSPSolver:
+    def __init__(self, data):
+        self.data = data
+        self.coa_name = data.get("coa_name", "COA")
+        self.tasks = data["tasks"]
+        self.resources = {}
+        for category in ("personnel", "equipment"):
+            self.resources.update(data.get("resources", {}).get(category, {}))
+
+        self.task_index = {t["id"]: i for i, t in enumerate(self.tasks)}
+        self.model = cp_model.CpModel()
+        self.starts = {}
+        self.ends = {}
+        self.intervals = {}
+        self.horizon = sum(t["duration"] for t in self.tasks) + 1
+
+    def build(self):
+        model = self.model
+
+        # Create interval variables for each task
+        for t in self.tasks:
+            tid = t["id"]
+            dur = t["duration"]
+            if dur < 0:
+                raise ValueError(f"Task {tid} has negative duration")
+            start = model.NewIntVar(0, self.horizon, f"start_{tid}")
+            end = model.NewIntVar(0, self.horizon, f"end_{tid}")
+            interval = model.NewIntervalVar(start, dur, end, f"interval_{tid}")
+            self.starts[tid] = start
+            self.ends[tid] = end
+            self.intervals[tid] = interval
+
+        # Precedence constraints (directed edges: predecessor -> task)
+        for t in self.tasks:
+            tid = t["id"]
+            for pred in t.get("predecessors", []):
+                if pred not in self.task_index:
+                    raise ValueError(
+                        f"Task {tid} lists unknown predecessor '{pred}'"
+                    )
+                model.Add(self.starts[tid] >= self.ends[pred])
+
+        # Resource capacity constraints (cumulative per resource type)
+        for res_name, capacity in self.resources.items():
+            demands = []
+            intervals_for_res = []
+            for t in self.tasks:
+                req = t.get("requires", {}).get(res_name, 0)
+                if req > 0:
+                    if req > capacity:
+                        raise ValueError(
+                            f"Task {t['id']} requires {req} of '{res_name}' "
+                            f"but only {capacity} exist — infeasible."
+                        )
+                    intervals_for_res.append(self.intervals[t["id"]])
+                    demands.append(req)
+            if intervals_for_res:
+                model.AddCumulative(intervals_for_res, demands, capacity)
+
+        # Objective: minimize makespan
+        makespan = model.NewIntVar(0, self.horizon, "makespan")
+        model.AddMaxEquality(makespan, [self.ends[t["id"]] for t in self.tasks])
+        model.Minimize(makespan)
+        self.makespan_var = makespan
+
+    def solve(self, time_limit_seconds=30):
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = time_limit_seconds
+        solver.parameters.num_search_workers = 8
+        status = solver.Solve(self.model)
+
+        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            raise RuntimeError(
+                f"Solver could not find a feasible schedule "
+                f"(status={solver.StatusName(status)}). "
+                f"Check for resource over-requests or precedence cycles."
+            )
+
+        is_optimal = status == cp_model.OPTIMAL
+        results = []
+        for t in self.tasks:
+            tid = t["id"]
+            results.append({
+                "id": tid,
+                "name": t["name"],
+                "start": solver.Value(self.starts[tid]),
+                "end": solver.Value(self.ends[tid]),
+                "duration": t["duration"],
+                "predecessors": t.get("predecessors", []),
+                "requires": t.get("requires", {}),
+            })
+
+        return {
+            "status": solver.StatusName(status),
+            "optimal": is_optimal,
+            "makespan": solver.Value(self.makespan_var),
+            "tasks": results,
+        }
+
+
+def detect_cycles(tasks):
+    """Basic cycle check so we fail with a clear message, not a solver error."""
+    graph = {t["id"]: t.get("predecessors", []) for t in tasks}
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = {tid: WHITE for tid in graph}
+
+    def visit(node, stack):
+        color[node] = GRAY
+        for pred in graph.get(node, []):
+            if pred not in color:
+                continue
+            if color[pred] == GRAY:
+                cycle = " -> ".join(stack + [pred])
+                raise ValueError(f"Precedence cycle detected: {cycle}")
+            if color[pred] == WHITE:
+                visit(pred, stack + [pred])
+        color[node] = BLACK
+
+    for tid in graph:
+        if color[tid] == WHITE:
+            visit(tid, [tid])
+
+
+def write_project_csv(result, output_path, project_start=None):
+    """
+    Write a CSV in a layout MS Project can import directly via
+    File > Open > (select CSV) > Import Wizard, mapping:
+      Task Name, Duration (days), Start, Finish, Predecessors, Resource Names
+    """
+    if project_start is None:
+        project_start = datetime.today()
+    elif isinstance(project_start, str):
+        project_start = datetime.strptime(project_start, "%Y-%m-%d")
+
+    id_to_name = {t["id"]: t["name"] for t in result["tasks"]}
+
+    lines = ["Task Name,Duration,Start,Finish,Predecessors,Resource Names"]
+    for t in sorted(result["tasks"], key=lambda x: x["start"]):
+        start_date = project_start + timedelta(days=t["start"])
+        finish_date = project_start + timedelta(days=t["end"])
+        preds = ";".join(id_to_name[p] for p in t["predecessors"])
+        resources = ";".join(
+            f"{name}[{qty}]" for name, qty in t["requires"].items()
+        )
+        dur = t["duration"]
+
+        def esc(field):
+            field = str(field)
+            if "," in field or '"' in field:
+                field = '"' + field.replace('"', '""') + '"'
+            return field
+
+        lines.append(",".join([
+            esc(t["name"]),
+            f"{dur} days",
+            start_date.strftime("%m/%d/%Y"),
+            finish_date.strftime("%m/%d/%Y"),
+            esc(preds),
+            esc(resources),
+        ]))
+
+    with open(output_path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def print_summary(result, coa_name):
+    print(f"\n{'='*60}")
+    print(f"  {coa_name}")
+    print(f"{'='*60}")
+    print(f"  Status:   {result['status']}"
+          f"{'  (proven optimal)' if result['optimal'] else '  (best found within time limit — not proven optimal)'}")
+    print(f"  Makespan: {result['makespan']} day(s)")
+    print(f"{'-'*60}")
+    print(f"  {'Task':<28}{'Start':>7}{'End':>7}{'Dur':>7}")
+    print(f"{'-'*60}")
+    for t in sorted(result["tasks"], key=lambda x: x["start"]):
+        print(f"  {t['name']:<28}{t['start']:>7}{t['end']:>7}{t['duration']:>7}")
+    print(f"{'='*60}\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Solve an RCPSP instance with CP-SAT and export an "
+                     "MS-Project-importable CSV schedule."
+    )
+    parser.add_argument("--input", required=True, help="Path to input JSON file")
+    parser.add_argument("--output", required=True, help="Path to output CSV file")
+    parser.add_argument("--project-start", default=None,
+                         help="Project start date, YYYY-MM-DD (default: today)")
+    parser.add_argument("--time-limit", type=int, default=30,
+                         help="Solver time limit in seconds (default: 30)")
+    args = parser.parse_args()
+
+    with open(args.input) as f:
+        data = json.load(f)
+
+    detect_cycles(data["tasks"])
+
+    solver = RCPSPSolver(data)
+    solver.build()
+    result = solver.solve(time_limit_seconds=args.time_limit)
+
+    print_summary(result, solver.coa_name)
+    write_project_csv(result, args.output, project_start=args.project_start)
+    print(f"Schedule written to: {args.output}")
+    print("Import into MS Project via File > Open, select the CSV, "
+          "and map columns if prompted.\n")
+
+
+if __name__ == "__main__":
+    main()
