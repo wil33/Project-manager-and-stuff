@@ -1,0 +1,73 @@
+{
+  "coa_name": "COA 1 - Northern Route",
+  "resources": {
+    "personnel": {
+      "engineers": 4,
+      "surveyors": 2,
+      "laborers": 10
+    },
+    "equipment": {
+      "excavator": 2,
+      "crane": 1,
+      "grader": 2
+    }
+  },
+  "tasks": [
+    {
+      "id": "T1",
+      "name": "Site survey",
+      "duration": 3,
+      "predecessors": [],
+      "requires": { "surveyors": 2 }
+    },
+    {
+      "id": "T2",
+      "name": "Site clearing",
+      "duration": 4,
+      "predecessors": ["T1"],
+      "requires": { "laborers": 6, "grader": 1 }
+    },
+    {
+      "id": "T3",
+      "name": "Excavation - foundation",
+      "duration": 5,
+      "predecessors": ["T2"],
+      "requires": { "engineers": 2, "excavator": 2 }
+    },
+    {
+      "id": "T4",
+      "name": "Utility trenching",
+      "duration": 4,
+      "predecessors": ["T2"],
+      "requires": { "engineers": 1, "excavator": 1, "laborers": 4 }
+    },
+    {
+      "id": "T5",
+      "name": "Foundation pour",
+      "duration": 3,
+      "predecessors": ["T3"],
+      "requires": { "engineers": 2, "laborers": 8 }
+    },
+    {
+      "id": "T6",
+      "name": "Structural steel erection",
+      "duration": 6,
+      "predecessors": ["T5"],
+      "requires": { "engineers": 3, "crane": 1, "laborers": 6 }
+    },
+    {
+      "id": "T7",
+      "name": "Utility hookup",
+      "duration": 2,
+      "predecessors": ["T4", "T5"],
+      "requires": { "engineers": 1, "laborers": 3 }
+    },
+    {
+      "id": "T8",
+      "name": "Final grading",
+      "duration": 2,
+      "predecessors": ["T6", "T7"],
+      "requires": { "grader": 1, "laborers": 4 }
+    }
+  ]
+}
