@@ -1,0 +1,569 @@
+#!/usr/bin/env python3
+"""
+RCPSP Solver using Google OR-Tools CP-SAT — with PERT confidence intervals
+============================================================================
+
+Solves the Resource-Constrained Project Scheduling Problem (RCPSP) for
+one or more Courses of Action (COAs), given a heterogeneous input graph
+of tasks, personnel, and equipment nodes with directed precedence and
+resource-requirement edges.
+
+DURATION FORMAT (two supported forms, per task):
+  - Fixed:  "duration": 5
+  - PERT three-point estimate:
+        "duration": {"optimistic": 3, "most_likely": 5, "pessimistic": 9}
+
+How uncertainty is handled:
+  1. CP-SAT solves ONCE using each task's PERT *expected* duration
+     (te = (o + 4m + p) / 6, rounded to the nearest whole day) to find an
+     optimal precedence- and resource-feasible ORDERING and resource
+     allocation. CP-SAT itself solves deterministic problems, so it can't
+     optimize a distribution directly — this step fixes the schedule's
+     *structure* (which tasks compete for which resources, in what order).
+  2. That structure (encoded as a priority order) is then replayed through
+     a Monte Carlo simulation: thousands of iterations, each sampling
+     every task's duration from a Beta-PERT distribution, executed through
+     a resource-constrained serial schedule generation scheme (the
+     standard heuristic simulation method for RCPSP under uncertainty).
+     This produces an empirical distribution of finish dates that reflects
+     real resource contention — something a simple critical-path-variance
+     calculation would miss whenever resources (not just precedence) are
+     what's driving the schedule.
+  3. An analytic (critical-path-variance) estimate is also printed as a
+     fast sanity check, but the Monte Carlo numbers are the ones to trust
+     when resources are tightly constrained.
+
+Output: CSV per COA formatted for Microsoft Project import, with the
+baseline (expected-duration) schedule PLUS extra confidence-interval
+finish-date columns (P50/P80/P90/P95 by default). MS Project's import
+wizard only needs to map the columns it recognizes — the extra percentile
+columns can be left unmapped or imported as custom text fields.
+
+Requires: ortools (pip install ortools --break-system-packages)
+
+Usage:
+    python3 rcpsp_solver.py --input coa1.json --output coa1_schedule.csv
+    python3 rcpsp_solver.py --input coa1.json --output coa1_schedule.csv \
+        --project-start 2026-09-08 --mc-iterations 5000 \
+        --confidence-levels 50,80,90,95 --seed 42
+    python3 rcpsp_solver.py --input coa1.json --output coa1_schedule.csv --no-monte-carlo
+"""
+
+import argparse
+import json
+import math
+import random
+import sys
+from datetime import datetime, timedelta
+
+try:
+    from ortools.sat.python import cp_model
+except ImportError:
+    print("ERROR: ortools is not installed.")
+    print("Install it with: pip install ortools --break-system-packages")
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# PERT / three-point estimate helpers
+# ---------------------------------------------------------------------------
+
+def parse_duration_spec(duration_field, task_id):
+    """
+    Normalize a task's 'duration' field into an (optimistic, most_likely,
+    pessimistic) triple. Plain numbers become a zero-variance triple
+    (o == m == p), preserving backward compatibility with fixed-duration
+    inputs.
+    """
+    if isinstance(duration_field, (int, float)):
+        v = float(duration_field)
+        if v < 0:
+            raise ValueError(f"Task {task_id} has negative duration")
+        return v, v, v
+
+    if isinstance(duration_field, dict):
+        try:
+            o = float(duration_field["optimistic"])
+            m = float(duration_field["most_likely"])
+            p = float(duration_field["pessimistic"])
+        except KeyError as e:
+            raise ValueError(
+                f"Task {task_id} PERT duration missing field: {e}. "
+                f"Expected optimistic/most_likely/pessimistic."
+            )
+        if not (o <= m <= p):
+            raise ValueError(
+                f"Task {task_id} PERT duration must satisfy "
+                f"optimistic <= most_likely <= pessimistic "
+                f"(got {o}, {m}, {p})"
+            )
+        if o < 0:
+            raise ValueError(f"Task {task_id} has negative optimistic duration")
+        return o, m, p
+
+    raise ValueError(
+        f"Task {task_id} has unrecognized duration format: {duration_field!r}"
+    )
+
+
+def pert_expected(o, m, p):
+    return (o + 4.0 * m + p) / 6.0
+
+
+def pert_variance(o, p):
+    return ((p - o) / 6.0) ** 2
+
+
+def sample_pert(o, m, p, rng):
+    """Sample from the Beta-PERT distribution over [o, p] with mode m."""
+    if p <= o:
+        return o
+    if m <= o:
+        alpha = 1.0
+    else:
+        alpha = 1.0 + 4.0 * (m - o) / (p - o)
+    if m >= p:
+        beta = 1.0
+    else:
+        beta = 1.0 + 4.0 * (p - m) / (p - o)
+    alpha = max(alpha, 1e-6)
+    beta = max(beta, 1e-6)
+    return o + rng.betavariate(alpha, beta) * (p - o)
+
+
+def percentile(data, pct):
+    """Linear-interpolation percentile, no numpy dependency."""
+    if not data:
+        return None
+    s = sorted(data)
+    if len(s) == 1:
+        return s[0]
+    k = (len(s) - 1) * (pct / 100.0)
+    f, c = math.floor(k), math.ceil(k)
+    if f == c:
+        return s[int(k)]
+    return s[int(f)] * (c - k) + s[int(c)] * (k - f)
+
+
+Z_SCORES = {50: 0.0, 80: 0.8416, 85: 1.0364, 90: 1.2816, 95: 1.6449, 99: 2.3263}
+
+
+def z_for_confidence(pct):
+    if pct in Z_SCORES:
+        return Z_SCORES[pct]
+    # Reasonable fallback for arbitrary percentiles via a quick approximation
+    # (Acklam's algorithm would be more precise; this covers typical PM
+    # reporting levels well and avoids adding a scipy dependency).
+    from statistics import NormalDist
+    return NormalDist().inv_cdf(pct / 100.0)
+
+
+# ---------------------------------------------------------------------------
+# CP-SAT deterministic solve (on PERT-expected durations)
+# ---------------------------------------------------------------------------
+
+class RCPSPSolver:
+    def __init__(self, data):
+        self.data = data
+        self.coa_name = data.get("coa_name", "COA")
+        self.tasks = data["tasks"]
+        self.resources = {}
+        for category in ("personnel", "equipment"):
+            self.resources.update(data.get("resources", {}).get(category, {}))
+
+        self.task_index = {t["id"]: i for i, t in enumerate(self.tasks)}
+
+        # Parse duration specs once; used both for CP-SAT (expected value)
+        # and later for Monte Carlo sampling.
+        self.duration_specs = {}       # tid -> (o, m, p)
+        self.expected_duration = {}    # tid -> rounded expected int duration
+        for t in self.tasks:
+            o, m, p = parse_duration_spec(t["duration"], t["id"])
+            self.duration_specs[t["id"]] = (o, m, p)
+            te = pert_expected(o, m, p)
+            self.expected_duration[t["id"]] = max(0, round(te))
+
+        self.model = cp_model.CpModel()
+        self.starts = {}
+        self.ends = {}
+        self.intervals = {}
+        self.horizon = sum(self.expected_duration.values()) + 1
+
+    def build(self):
+        model = self.model
+
+        for t in self.tasks:
+            tid = t["id"]
+            dur = self.expected_duration[tid]
+            start = model.NewIntVar(0, self.horizon, f"start_{tid}")
+            end = model.NewIntVar(0, self.horizon, f"end_{tid}")
+            interval = model.NewIntervalVar(start, dur, end, f"interval_{tid}")
+            self.starts[tid] = start
+            self.ends[tid] = end
+            self.intervals[tid] = interval
+
+        for t in self.tasks:
+            tid = t["id"]
+            for pred in t.get("predecessors", []):
+                if pred not in self.task_index:
+                    raise ValueError(
+                        f"Task {tid} lists unknown predecessor '{pred}'"
+                    )
+                model.Add(self.starts[tid] >= self.ends[pred])
+
+        for res_name, capacity in self.resources.items():
+            demands = []
+            intervals_for_res = []
+            for t in self.tasks:
+                req = t.get("requires", {}).get(res_name, 0)
+                if req > 0:
+                    if req > capacity:
+                        raise ValueError(
+                            f"Task {t['id']} requires {req} of '{res_name}' "
+                            f"but only {capacity} exist — infeasible."
+                        )
+                    intervals_for_res.append(self.intervals[t["id"]])
+                    demands.append(req)
+            if intervals_for_res:
+                model.AddCumulative(intervals_for_res, demands, capacity)
+
+        makespan = model.NewIntVar(0, self.horizon, "makespan")
+        model.AddMaxEquality(makespan, [self.ends[t["id"]] for t in self.tasks])
+        model.Minimize(makespan)
+        self.makespan_var = makespan
+
+    def solve(self, time_limit_seconds=30):
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = time_limit_seconds
+        solver.parameters.num_search_workers = 8
+        status = solver.Solve(self.model)
+
+        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            raise RuntimeError(
+                f"Solver could not find a feasible schedule "
+                f"(status={solver.StatusName(status)}). "
+                f"Check for resource over-requests or precedence cycles."
+            )
+
+        is_optimal = status == cp_model.OPTIMAL
+        results = []
+        for t in self.tasks:
+            tid = t["id"]
+            o, m, p = self.duration_specs[tid]
+            results.append({
+                "id": tid,
+                "name": t["name"],
+                "start": solver.Value(self.starts[tid]),
+                "end": solver.Value(self.ends[tid]),
+                "duration": self.expected_duration[tid],
+                "duration_pert": {"optimistic": o, "most_likely": m, "pessimistic": p},
+                "predecessors": t.get("predecessors", []),
+                "requires": t.get("requires", {}),
+            })
+
+        return {
+            "status": solver.StatusName(status),
+            "optimal": is_optimal,
+            "makespan": solver.Value(self.makespan_var),
+            "tasks": results,
+        }
+
+
+def detect_cycles(tasks):
+    graph = {t["id"]: t.get("predecessors", []) for t in tasks}
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = {tid: WHITE for tid in graph}
+
+    def visit(node, stack):
+        color[node] = GRAY
+        for pred in graph.get(node, []):
+            if pred not in color:
+                continue
+            if color[pred] == GRAY:
+                cycle = " -> ".join(stack + [pred])
+                raise ValueError(f"Precedence cycle detected: {cycle}")
+            if color[pred] == WHITE:
+                visit(pred, stack + [pred])
+        color[node] = BLACK
+
+    for tid in graph:
+        if color[tid] == WHITE:
+            visit(tid, [tid])
+
+
+# ---------------------------------------------------------------------------
+# Approximate analytic confidence interval (critical-path variance)
+# ---------------------------------------------------------------------------
+
+def find_critical_path(result):
+    """
+    Approximate critical path by walking backward from whichever task(s)
+    end at the makespan, following any predecessor whose end exactly
+    matches this task's start. This reflects the PRECEDENCE-driven
+    critical path in the achieved solve — it does not account for
+    resource contention, which is why the Monte Carlo estimate below is
+    the more trustworthy figure whenever resources (not just precedence)
+    are what's constraining the schedule.
+    """
+    by_id = {t["id"]: t for t in result["tasks"]}
+    makespan = result["makespan"]
+    current = next((t for t in result["tasks"] if t["end"] == makespan), None)
+    path = []
+    while current is not None:
+        path.append(current["id"])
+        nxt = None
+        for pred in current["predecessors"]:
+            pt = by_id[pred]
+            if pt["end"] == current["start"]:
+                nxt = pt
+                break
+        current = nxt
+    return list(reversed(path))
+
+
+def analytic_confidence(result, duration_specs, confidence_levels):
+    path = find_critical_path(result)
+    variance = sum(pert_variance(*duration_specs[tid][::2]) for tid in path)
+    # duration_specs[tid] is (o, m, p); [::2] gives (o, p)
+    std = math.sqrt(variance)
+    makespan = result["makespan"]
+    out = {}
+    for pct in confidence_levels:
+        z = z_for_confidence(pct)
+        out[pct] = makespan + z * std
+    return {"critical_path": path, "std_dev": std, "levels": out}
+
+
+# ---------------------------------------------------------------------------
+# Monte Carlo simulation (resource-aware, via serial schedule generation)
+# ---------------------------------------------------------------------------
+
+def simulate_once(tasks_by_id, order_index, successors, durations,
+                   resources_capacity, resource_reqs):
+    """
+    One Monte Carlo iteration: replay the priority order CP-SAT settled on
+    (order_index: lower = higher priority), but with sampled durations,
+    respecting precedence and resource capacity via a serial schedule
+    generation scheme (the standard RCPSP simulation heuristic).
+    """
+    n = len(tasks_by_id)
+    remaining_preds = {tid: set(t["predecessors"]) for tid, t in tasks_by_id.items()}
+    ready = set(tid for tid, preds in remaining_preds.items() if not preds)
+    started = set()
+    finish_time = {}
+    in_progress = {}
+    usage = {res: 0 for res in resources_capacity}
+    current_time = 0.0
+
+    def can_start(tid):
+        reqs = resource_reqs.get(tid, {})
+        return all(usage.get(r, 0) + amt <= resources_capacity.get(r, 0)
+                   for r, amt in reqs.items())
+
+    def start_task(tid):
+        reqs = resource_reqs.get(tid, {})
+        for r, amt in reqs.items():
+            usage[r] = usage.get(r, 0) + amt
+        ft = current_time + durations[tid]
+        in_progress[tid] = ft
+        started.add(tid)
+        ready.discard(tid)
+
+    while len(finish_time) < n:
+        for tid in sorted(ready, key=lambda x: order_index.get(x, (0, 0))):
+            if can_start(tid):
+                start_task(tid)
+        if not in_progress:
+            stalled = set(tasks_by_id) - set(finish_time) - set(in_progress)
+            raise RuntimeError(
+                f"Simulation stalled — likely infeasible resource spec: {stalled}"
+            )
+        current_time = min(in_progress.values())
+        done_now = [tid for tid, ft in in_progress.items() if ft == current_time]
+        for tid in done_now:
+            finish_time[tid] = in_progress.pop(tid)
+            reqs = resource_reqs.get(tid, {})
+            for r, amt in reqs.items():
+                usage[r] -= amt
+            for succ in successors.get(tid, []):
+                remaining_preds[succ].discard(tid)
+                if not remaining_preds[succ] and succ not in started:
+                    ready.add(succ)
+
+    return finish_time
+
+
+def run_monte_carlo(tasks, resources_capacity, order_index, duration_specs,
+                     n_iterations, seed=None):
+    rng = random.Random(seed)
+    tasks_by_id = {t["id"]: t for t in tasks}
+    successors = {tid: [] for tid in tasks_by_id}
+    for t in tasks:
+        for pred in t.get("predecessors", []):
+            successors[pred].append(t["id"])
+    resource_reqs = {t["id"]: t.get("requires", {}) for t in tasks}
+
+    per_task_finishes = {tid: [] for tid in tasks_by_id}
+    makespans = []
+    for _ in range(n_iterations):
+        durations = {tid: sample_pert(*duration_specs[tid], rng) for tid in tasks_by_id}
+        finishes = simulate_once(tasks_by_id, order_index, successors, durations,
+                                  resources_capacity, resource_reqs)
+        for tid, ft in finishes.items():
+            per_task_finishes[tid].append(ft)
+        makespans.append(max(finishes.values()))
+
+    return per_task_finishes, makespans
+
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+def write_project_csv(result, output_path, project_start=None,
+                       per_task_finishes=None, confidence_levels=None):
+    """
+    CSV for MS Project import. Baseline columns (Task Name, Duration,
+    Start, Finish, Predecessors, Resource Names) use the expected-duration
+    schedule. If Monte Carlo results are supplied, extra
+    'Finish (P<level>)' columns are appended — informational only; MS
+    Project's import wizard can leave them unmapped.
+    """
+    if project_start is None:
+        project_start = datetime.today()
+    elif isinstance(project_start, str):
+        project_start = datetime.strptime(project_start, "%Y-%m-%d")
+
+    id_to_name = {t["id"]: t["name"] for t in result["tasks"]}
+    confidence_levels = confidence_levels or []
+
+    header = ["Task Name", "Duration", "Start", "Finish", "Predecessors", "Resource Names"]
+    header += [f"Finish (P{pct})" for pct in confidence_levels]
+    lines = [",".join(header)]
+
+    def esc(field):
+        field = str(field)
+        if "," in field or '"' in field:
+            field = '"' + field.replace('"', '""') + '"'
+        return field
+
+    for t in sorted(result["tasks"], key=lambda x: x["start"]):
+        start_date = project_start + timedelta(days=t["start"])
+        finish_date = project_start + timedelta(days=t["end"])
+        preds = ";".join(id_to_name[p] for p in t["predecessors"])
+        resources = ";".join(f"{name}[{qty}]" for name, qty in t["requires"].items())
+
+        row = [
+            esc(t["name"]),
+            f"{t['duration']} days",
+            start_date.strftime("%m/%d/%Y"),
+            finish_date.strftime("%m/%d/%Y"),
+            esc(preds),
+            esc(resources),
+        ]
+        if per_task_finishes is not None:
+            for pct in confidence_levels:
+                pf_days = percentile(per_task_finishes[t["id"]], pct)
+                pf_date = project_start + timedelta(days=pf_days)
+                row.append(pf_date.strftime("%m/%d/%Y"))
+        lines.append(",".join(row))
+
+    with open(output_path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def print_summary(result, coa_name, analytic=None, mc_makespans=None,
+                   confidence_levels=None):
+    print(f"\n{'='*68}")
+    print(f"  {coa_name}")
+    print(f"{'='*68}")
+    print(f"  Status:   {result['status']}"
+          f"{'  (proven optimal)' if result['optimal'] else '  (best found within time limit)'}")
+    print(f"  Expected makespan (PERT mean durations): {result['makespan']} day(s)")
+    print(f"{'-'*68}")
+    print(f"  {'Task':<26}{'Start':>6}{'End':>6}{'E[Dur]':>8}")
+    print(f"{'-'*68}")
+    for t in sorted(result["tasks"], key=lambda x: x["start"]):
+        print(f"  {t['name']:<26}{t['start']:>6}{t['end']:>6}{t['duration']:>8}")
+
+    if analytic:
+        print(f"{'-'*68}")
+        print(f"  Analytic estimate (critical-path variance, precedence-only):")
+        print(f"    Critical path: {' -> '.join(analytic['critical_path'])}")
+        print(f"    Std dev: {analytic['std_dev']:.2f} day(s)")
+        for pct, val in analytic["levels"].items():
+            print(f"    P{pct} makespan: {val:.1f} day(s)")
+
+    if mc_makespans:
+        print(f"{'-'*68}")
+        print(f"  Monte Carlo estimate ({len(mc_makespans)} iterations, "
+              f"resource-aware):")
+        for pct in confidence_levels:
+            val = percentile(mc_makespans, pct)
+            print(f"    P{pct} makespan: {val:.1f} day(s)")
+        if analytic and abs(percentile(mc_makespans, 90) - analytic["levels"].get(90, 0)) > 2:
+            print(f"    Note: Monte Carlo and analytic P90 diverge by "
+                  f">2 days — resource contention is a significant driver "
+                  f"here; trust the Monte Carlo figures.")
+    print(f"{'='*68}\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Solve an RCPSP instance with CP-SAT, quantify PERT "
+                     "duration uncertainty via Monte Carlo, and export an "
+                     "MS-Project-importable CSV schedule."
+    )
+    parser.add_argument("--input", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--project-start", default=None,
+                         help="YYYY-MM-DD (default: today)")
+    parser.add_argument("--time-limit", type=int, default=30,
+                         help="CP-SAT solver time limit in seconds")
+    parser.add_argument("--mc-iterations", type=int, default=2000,
+                         help="Monte Carlo iterations (default: 2000)")
+    parser.add_argument("--confidence-levels", default="50,80,90,95",
+                         help="Comma-separated percentiles, e.g. 50,80,90,95")
+    parser.add_argument("--seed", type=int, default=None,
+                         help="Random seed for reproducible Monte Carlo runs")
+    parser.add_argument("--no-monte-carlo", action="store_true",
+                         help="Skip simulation; use only the deterministic "
+                              "expected-duration schedule and analytic CI")
+    args = parser.parse_args()
+
+    confidence_levels = sorted(int(x) for x in args.confidence_levels.split(","))
+
+    with open(args.input) as f:
+        data = json.load(f)
+
+    detect_cycles(data["tasks"])
+
+    solver = RCPSPSolver(data)
+    solver.build()
+    result = solver.solve(time_limit_seconds=args.time_limit)
+
+    analytic = analytic_confidence(result, solver.duration_specs, confidence_levels)
+
+    per_task_finishes = None
+    mc_makespans = None
+    if not args.no_monte_carlo:
+        order_index = {t["id"]: (t["start"], i) for i, t in enumerate(result["tasks"])}
+        per_task_finishes, mc_makespans = run_monte_carlo(
+            data["tasks"], solver.resources, order_index, solver.duration_specs,
+            n_iterations=args.mc_iterations, seed=args.seed,
+        )
+
+    print_summary(result, solver.coa_name, analytic=analytic,
+                  mc_makespans=mc_makespans, confidence_levels=confidence_levels)
+
+    write_project_csv(result, args.output, project_start=args.project_start,
+                       per_task_finishes=per_task_finishes,
+                       confidence_levels=confidence_levels if per_task_finishes else None)
+    print(f"Schedule written to: {args.output}")
+    print("Import into MS Project via File > Open, select the CSV, and map "
+          "the baseline columns; the P<n> finish-date columns are extra "
+          "reference info and can be left unmapped.\n")
+
+
+if __name__ == "__main__":
+    main()
